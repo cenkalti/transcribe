@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -29,8 +31,8 @@ type DiarizedSegment struct {
 
 // TranscriptionResponse represents the API response
 type TranscriptionResponse struct {
-	Text     string             `json:"text"`
-	Segments []DiarizedSegment  `json:"segments"`
+	Text     string            `json:"text"`
+	Segments []DiarizedSegment `json:"segments"`
 }
 
 func main() {
@@ -42,7 +44,7 @@ func main() {
 	videoFile := os.Args[1]
 
 	// Load API key from .env
-	apiKey, err := loadEnv()
+	err := godotenv.Load()
 	if err != nil {
 		fmt.Printf("Error loading .env file: %v\n", err)
 		os.Exit(1)
@@ -59,7 +61,7 @@ func main() {
 
 	// Transcribe with diarization
 	fmt.Println("Transcribing audio with speaker diarization...")
-	transcription, err := transcribeAudio(mp3File, apiKey)
+	transcription, err := transcribeAudio(mp3File, os.Getenv("OPENAI_API_KEY"))
 	if err != nil {
 		fmt.Printf("Error transcribing audio: %v\n", err)
 		os.Exit(1)
@@ -74,39 +76,6 @@ func main() {
 	}
 
 	fmt.Printf("Transcription saved to: %s\n", outputFile)
-}
-
-// loadEnv reads the .env file and returns the OPENAI_API_KEY
-func loadEnv() (string, error) {
-	data, err := os.ReadFile(".env")
-	if err != nil {
-		return "", fmt.Errorf("failed to read .env file: %w", err)
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
-			// Remove quotes if present
-			value = strings.Trim(value, `"'`)
-
-			if key == "OPENAI_API_KEY" {
-				if value == "" {
-					return "", fmt.Errorf("OPENAI_API_KEY is empty in .env")
-				}
-				return value, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("OPENAI_API_KEY not found in .env")
 }
 
 // convertToMP3 converts a video file to MP3 format using FFmpeg
