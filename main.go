@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,24 +16,36 @@ import (
 )
 
 const (
-	openAIAPIURL    = "https://api.openai.com/v1/audio/transcriptions"
-	model           = "gpt-4o-transcribe-diarize"
-	maxDuration     = 1400 // Maximum duration in seconds for the diarization model
-	chunkDuration   = 1200 // Split into 20-minute chunks to stay under the limit
+	assemblyAIBaseURL = "https://api.assemblyai.com/v2"
 )
 
-// DiarizedSegment represents a single transcribed segment with speaker info
-type DiarizedSegment struct {
-	Speaker string  `json:"speaker"`
-	Start   float64 `json:"start"`
-	End     float64 `json:"end"`
-	Text    string  `json:"text"`
+// Utterance represents a single transcribed utterance with speaker info
+type Utterance struct {
+	Speaker    string  `json:"speaker"`
+	Start      int     `json:"start"`
+	End        int     `json:"end"`
+	Text       string  `json:"text"`
+	Confidence float64 `json:"confidence"`
+}
+
+// TranscriptRequest represents the request to create a transcript
+type TranscriptRequest struct {
+	AudioURL      string `json:"audio_url"`
+	SpeakerLabels bool   `json:"speaker_labels"`
 }
 
 // TranscriptionResponse represents the API response
 type TranscriptionResponse struct {
-	Text     string            `json:"text"`
-	Segments []DiarizedSegment `json:"segments"`
+	ID         string      `json:"id"`
+	Status     string      `json:"status"`
+	Text       string      `json:"text"`
+	Utterances []Utterance `json:"utterances"`
+	Error      string      `json:"error"`
+}
+
+// UploadResponse represents the upload endpoint response
+type UploadResponse struct {
+	UploadURL string `json:"upload_url"`
 }
 
 func main() {
@@ -52,6 +63,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	apiKey := os.Getenv("ASSEMBLYAI_API_KEY")
+	if apiKey == "" {
+		fmt.Println("Error: ASSEMBLYAI_API_KEY not found in .env")
+		os.Exit(1)
+	}
+
 	// Convert video to MP3
 	fmt.Println("Converting video to MP3...")
 	mp3File, err := convertToMP3(videoFile)
@@ -61,32 +78,20 @@ func main() {
 	}
 	defer os.Remove(mp3File)
 
-	// Get audio duration
-	duration, err := getAudioDuration(mp3File)
+	// Upload audio file
+	fmt.Println("Uploading audio file...")
+	uploadURL, err := uploadAudio(mp3File, apiKey)
 	if err != nil {
-		fmt.Printf("Error getting audio duration: %v\n", err)
+		fmt.Printf("Error uploading audio: %v\n", err)
 		os.Exit(1)
 	}
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
-
 	// Transcribe with diarization
-	var transcription *TranscriptionResponse
-	if duration > maxDuration {
-		// Split into chunks
-		fmt.Printf("Audio is %.0f seconds, splitting into chunks...\n", duration)
-		transcription, err = transcribeAudioInChunks(mp3File, apiKey, duration)
-		if err != nil {
-			fmt.Printf("Error transcribing audio: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		fmt.Println("Transcribing audio with speaker diarization...")
-		transcription, err = transcribeAudio(mp3File, apiKey)
-		if err != nil {
-			fmt.Printf("Error transcribing audio: %v\n", err)
-			os.Exit(1)
-		}
+	fmt.Println("Transcribing audio with speaker diarization...")
+	transcription, err := transcribeAudio(uploadURL, apiKey)
+	if err != nil {
+		fmt.Printf("Error transcribing audio: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Save to output file
@@ -98,119 +103,6 @@ func main() {
 	}
 
 	fmt.Printf("Transcription saved to: %s\n", outputFile)
-}
-
-// getAudioDuration returns the duration of an audio file in seconds using FFmpeg
-func getAudioDuration(audioFile string) (float64, error) {
-	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audioFile)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("ffprobe failed: %w", err)
-	}
-
-	var duration float64
-	_, err := fmt.Sscanf(strings.TrimSpace(out.String()), "%f", &duration)
-	if err != nil {
-		return 0, fmt.Errorf("failed to parse duration: %w", err)
-	}
-
-	return duration, nil
-}
-
-// splitAudioIntoChunks splits an audio file into chunks of specified duration using FFmpeg
-func splitAudioIntoChunks(audioFile string, chunkDuration int) ([]string, error) {
-	duration, err := getAudioDuration(audioFile)
-	if err != nil {
-		return nil, err
-	}
-
-	var chunks []string
-	numChunks := int(duration)/chunkDuration + 1
-
-	for i := 0; i < numChunks; i++ {
-		startTime := i * chunkDuration
-
-		// Create temporary chunk file
-		tmpFile, err := os.CreateTemp("", fmt.Sprintf("chunk-%d-*.mp3", i))
-		if err != nil {
-			// Clean up previously created chunks
-			for _, chunk := range chunks {
-				os.Remove(chunk)
-			}
-			return nil, fmt.Errorf("failed to create temp chunk file: %w", err)
-		}
-		tmpFile.Close()
-		chunkPath := tmpFile.Name()
-
-		// Extract chunk using FFmpeg
-		cmd := exec.Command("ffmpeg", "-i", audioFile, "-ss", fmt.Sprintf("%d", startTime), "-t", fmt.Sprintf("%d", chunkDuration), "-acodec", "copy", chunkPath, "-y")
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-
-		if err := cmd.Run(); err != nil {
-			// Clean up
-			os.Remove(chunkPath)
-			for _, chunk := range chunks {
-				os.Remove(chunk)
-			}
-			return nil, fmt.Errorf("ffmpeg chunk extraction failed: %w\nOutput: %s", err, stderr.String())
-		}
-
-		chunks = append(chunks, chunkPath)
-	}
-
-	return chunks, nil
-}
-
-// transcribeAudioInChunks splits audio and transcribes each chunk, combining results
-func transcribeAudioInChunks(audioFile, apiKey string, duration float64) (*TranscriptionResponse, error) {
-	// Split audio into chunks
-	chunks, err := splitAudioIntoChunks(audioFile, chunkDuration)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		for _, chunk := range chunks {
-			os.Remove(chunk)
-		}
-	}()
-
-	fmt.Printf("Split into %d chunks\n", len(chunks))
-
-	// Transcribe each chunk
-	var allSegments []DiarizedSegment
-	var fullText strings.Builder
-	var timeOffset float64
-
-	for i, chunk := range chunks {
-		fmt.Printf("Transcribing chunk %d/%d...\n", i+1, len(chunks))
-
-		transcription, err := transcribeAudio(chunk, apiKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to transcribe chunk %d: %w", i, err)
-		}
-
-		// Adjust timestamps and append segments
-		for _, segment := range transcription.Segments {
-			segment.Start += timeOffset
-			segment.End += timeOffset
-			allSegments = append(allSegments, segment)
-		}
-
-		if transcription.Text != "" {
-			fullText.WriteString(transcription.Text)
-			fullText.WriteString(" ")
-		}
-
-		timeOffset += float64(chunkDuration)
-	}
-
-	return &TranscriptionResponse{
-		Text:     strings.TrimSpace(fullText.String()),
-		Segments: allSegments,
-	}, nil
 }
 
 // convertToMP3 converts a video file to MP3 format using FFmpeg
@@ -242,96 +134,143 @@ func convertToMP3(videoFile string) (string, error) {
 	return mp3Path, nil
 }
 
-// transcribeAudio sends the audio file to OpenAI API for transcription with diarization
-func transcribeAudio(audioFile, apiKey string) (*TranscriptionResponse, error) {
-	// Open the audio file
+// uploadAudio uploads an audio file to AssemblyAI and returns the upload URL
+func uploadAudio(audioFile, apiKey string) (string, error) {
 	file, err := os.Open(audioFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open audio file: %w", err)
+		return "", fmt.Errorf("failed to open audio file: %w", err)
 	}
 	defer file.Close()
 
-	// Create multipart form
-	var requestBody bytes.Buffer
-	writer := multipart.NewWriter(&requestBody)
-
-	// Add file field
-	part, err := writer.CreateFormFile("file", filepath.Base(audioFile))
+	req, err := http.NewRequest("POST", assemblyAIBaseURL+"/upload", file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create form file: %w", err)
-	}
-	if _, err := io.Copy(part, file); err != nil {
-		return nil, fmt.Errorf("failed to copy file: %w", err)
+		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Add model field
-	if err := writer.WriteField("model", model); err != nil {
-		return nil, fmt.Errorf("failed to write model field: %w", err)
+	req.Header.Set("Authorization", apiKey)
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Add response_format field
-	if err := writer.WriteField("response_format", "diarized_json"); err != nil {
-		return nil, fmt.Errorf("failed to write response_format field: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Add chunking_strategy field
-	if err := writer.WriteField("chunking_strategy", "auto"); err != nil {
-		return nil, fmt.Errorf("failed to write chunking_strategy field: %w", err)
+	var uploadResp UploadResponse
+	if err := json.Unmarshal(body, &uploadResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close writer: %w", err)
+	return uploadResp.UploadURL, nil
+}
+
+// transcribeAudio submits audio for transcription and polls until complete
+func transcribeAudio(audioURL, apiKey string) (*TranscriptionResponse, error) {
+	// Submit transcription request
+	requestData := TranscriptRequest{
+		AudioURL:      audioURL,
+		SpeakerLabels: true,
 	}
 
-	// Create HTTP request
-	req, err := http.NewRequest("POST", openAIAPIURL, &requestBody)
+	jsonData, err := json.Marshal(requestData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", assemblyAIBaseURL+"/transcript", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", apiKey)
+	req.Header.Set("Content-Type", "application/json")
 
-	// Send request
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("transcription request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse response
 	var transcription TranscriptionResponse
 	if err := json.Unmarshal(body, &transcription); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	return &transcription, nil
+	transcriptID := transcription.ID
+
+	// Poll for completion
+	pollingURL := fmt.Sprintf("%s/transcript/%s", assemblyAIBaseURL, transcriptID)
+
+	for {
+		req, err := http.NewRequest("GET", pollingURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create polling request: %w", err)
+		}
+
+		req.Header.Set("Authorization", apiKey)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to poll: %w", err)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read polling response: %w", err)
+		}
+
+		if err := json.Unmarshal(body, &transcription); err != nil {
+			return nil, fmt.Errorf("failed to parse polling response: %w", err)
+		}
+
+		switch transcription.Status {
+		case "completed":
+			return &transcription, nil
+		case "error":
+			return nil, fmt.Errorf("transcription failed: %s", transcription.Error)
+		case "queued", "processing":
+			fmt.Printf("Status: %s... waiting\n", transcription.Status)
+			time.Sleep(3 * time.Second)
+		default:
+			return nil, fmt.Errorf("unexpected status: %s", transcription.Status)
+		}
+	}
 }
 
 // saveTranscription saves the transcription to a text file with speaker labels and timestamps
 func saveTranscription(filename string, transcription *TranscriptionResponse) error {
 	var output strings.Builder
 
-	// If we have segments with speaker info, format them nicely
-	if len(transcription.Segments) > 0 {
+	// If we have utterances with speaker info, format them nicely
+	if len(transcription.Utterances) > 0 {
 		currentSpeaker := ""
-		for _, segment := range transcription.Segments {
-			// Format timestamps
-			startTime := formatTimestamp(segment.Start)
-			endTime := formatTimestamp(segment.End)
+		for _, utterance := range transcription.Utterances {
+			// Format timestamps (convert milliseconds to HH:MM:SS)
+			startTime := formatTimestamp(float64(utterance.Start) / 1000.0)
+			endTime := formatTimestamp(float64(utterance.End) / 1000.0)
 
-			speaker := segment.Speaker
+			speaker := utterance.Speaker
 			if speaker == "" {
 				speaker = "Unknown"
 			}
@@ -341,17 +280,17 @@ func saveTranscription(filename string, transcription *TranscriptionResponse) er
 				if currentSpeaker != "" {
 					output.WriteString("\n")
 				}
-				output.WriteString(fmt.Sprintf("[%s - %s] %s:\n", startTime, endTime, speaker))
+				output.WriteString(fmt.Sprintf("[%s - %s] Speaker %s:\n", startTime, endTime, speaker))
 				currentSpeaker = speaker
 			} else {
 				output.WriteString(fmt.Sprintf("[%s - %s] ", startTime, endTime))
 			}
 
-			output.WriteString(strings.TrimSpace(segment.Text))
+			output.WriteString(strings.TrimSpace(utterance.Text))
 			output.WriteString("\n")
 		}
 	} else {
-		// Fallback to plain text if no segments
+		// Fallback to plain text if no utterances
 		output.WriteString(transcription.Text)
 		output.WriteString("\n")
 	}
